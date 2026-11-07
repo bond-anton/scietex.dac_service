@@ -1,0 +1,54 @@
+[project]
+name = "scietex.dac_service"
+description = "Scietex microservice daemon for SPI DAC devices"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICEN[CS]E*"]
+authors = [{ name = "Anton Bondarenko", email = "bond.anton@gmail.com" }]
+classifiers = [
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+]
+dependencies = [
+  "scietex.service[valkey]~=6.2.0",
+  "scietex.hal.dac>=0.3.0,<1.0.0",
+  "msgspec>=0.18.6",
+]
+dynamic = ["version"]
+
+[project.urls]
+"Bug Tracker" = "https://github.com/bond-anton/scietex.dac_service/issues"
+"Homepage" = "https://github.com/bond-anton/scietex.dac_service"
+
+[project.scripts]
+start-dac-service = "scietex.dac_service.run_worker:main"
+
+[project.optional-dependencies]
+dev = ["tox>=4.45.0"]
+lint = ["ruff", "ty"]
+test = ["pytest", "pytest-asyncio"]
+# SPI backends are optional: a core install can still build DAC objects from a
+# caller-supplied transport. An operator installs the extra for the board's
+# wiring — spidev for /dev/spidev*, gpiozero for plain GPIO pins.
+spi = ["scietex.hal.dac[spi]>=0.3.0,<1.0.0"]
+gpiozero = ["scietex.hal.dac[gpiozero]>=0.3.0,<1.0.0"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.setuptools.dynamic]
+version = { attr = "scietex.dac_service.version.__version__" }
+
+[tool.setuptools.package-data]
+"scietex.dac_service" = ["py.typed"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true
