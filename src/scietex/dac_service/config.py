@@ -51,8 +51,7 @@ class DacChannelSettings(msgspec.Struct, frozen=True, forbid_unknown_fields=True
     """One output channel of a device, keyed by its index in the part's geometry.
 
     ``channel`` is the output index ``dac:read``/``dac:write`` take.
-    ``poll_interval_ms`` is the per-channel sampling period; the device field of
-    the same name is the fallback for a channel with no explicit row.
+    ``poll_interval_ms`` is the sampling period for this channel.
     ``enabled=False`` keeps the channel writable on demand while excluding it
     from the poll plan.
 
@@ -93,9 +92,9 @@ class DacDeviceSettings(msgspec.Struct, frozen=True, forbid_unknown_fields=True)
 
     ``poll`` is service-level, not a HAL argument: it excludes a device from
     `devices.poll_plan` while keeping it addressable for on-demand writes and
-    reads. ``poll_interval_ms`` is the period for a channel with no explicit
-    `DacChannelSettings` row; an empty ``channels`` list samples every output
-    the HAL part reports at that period.
+    reads. ``channels`` names the outputs to sample; an empty list means the
+    device is not polled at all, since a channel is sampled only through an
+    explicit `DacChannelSettings` row.
     """
 
     type: str
@@ -115,7 +114,6 @@ class DacDeviceSettings(msgspec.Struct, frozen=True, forbid_unknown_fields=True)
     r_ab: float | None = None
     grounded: str | None = None
     poll: bool = True
-    poll_interval_ms: int = 2000
     channels: list[DacChannelSettings] = msgspec.field(default_factory=list)
 
 

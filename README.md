@@ -89,7 +89,8 @@ Per-device fields: `type` (required), `port`/`device` for the SPI wiring, the
 gpiozero pins (`clock_pin`/`mosi_pin`/`miso_pin`/`select_pin`), `reference`,
 `label`, `log_level`, and the part-specific `range`, `load_pin`, `latch_pin`,
 `r_ab`, `grounded`. Unknown fields are rejected. `port` is the SPI bus number
-and `device` is the chip-select.
+and `device` is the chip-select. Polling is per channel: a device is sampled only
+through its `channels` rows and stays silent while that list is empty.
 
 ## Supported parts
 
@@ -133,11 +134,12 @@ failed to open answers `DEVICE_UNAVAILABLE` (retryable) from `dac:status`,
 
 The worker publishes to `scietex:DacService:<instance_id>:telemetry` every 2 s
 with a 6 s TTL. The snapshot lists every configured device with its open state,
-part type, and the channel state left by the last successful write. It is built
+part type, channel count (`channel_count`, omitted for a device that never
+opened), and the channel state left by the last successful write. It is built
 from the registry's last-written cache and live channel objects only: a
 telemetry tick never touches the bus, so it cannot disturb an in-flight write,
 and a write-only part still reports state. A device that was never written
-reports no channels rather than fabricated zeros.
+reports no channels rather than fabricated zeros. The payload revision is 3.
 
 ## Container and quadlet
 

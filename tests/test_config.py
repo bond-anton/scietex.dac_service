@@ -206,7 +206,6 @@ def test_device_polling_fields_default_so_an_old_entry_still_decodes() -> None:
     settings = msgspec.convert({"type": "MCP4822"}, DacDeviceSettings)
 
     assert settings.poll is True
-    assert settings.poll_interval_ms == 2000
     assert settings.channels == []
 
 

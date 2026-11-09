@@ -361,6 +361,15 @@ class DacDeviceRegistry:
         """
         return self.get(device_id).channels
 
+    def channel_count(self, device_id: str) -> int | None:
+        """Output count of the open device, or ``None`` when it is not open.
+
+        Used by telemetry, which reports the geometry of a device it can
+        address without touching the bus.
+        """
+        device = self._devices.get(device_id)
+        return None if device is None else len(device.channels)
+
     def poll_targets(self) -> list[tuple[str, hal.DAC]]:
         """Open devices whose settings entry has ``poll=True``, in settings order."""
         if self._settings is None:
@@ -525,10 +534,10 @@ def poll_plan(
     with ``poll=False``, an unopened device, and (service-wide)
     ``poll_enabled=False`` never reach the plan. Per device:
 
-    * an empty ``channels`` list samples every output the HAL part reports, at
-      the device ``poll_interval_ms``;
-    * an explicit channel row overrides that period and an ``enabled=False``
-      row is dropped;
+    * an empty ``channels`` list produces no entries: a device is sampled only
+      through explicit channel rows, so it stays silent until it is configured;
+    * an explicit channel row carries its own period and knobs, and an
+      ``enabled=False`` row is dropped;
     * a row naming an output the part does not have is dropped with a warning,
       because it could only fail on every tick;
     * every period is clamped to ``[MIN_INTERVAL_MS, MAX_INTERVAL_MS]`` with a
@@ -557,11 +566,15 @@ def _device_plan(
     cfg: DacDeviceSettings,
     logger: logging.Logger,
 ) -> list[DacChannelPlan]:
-    """Per-channel plan for one open device, with clamping and drops applied."""
+    """Per-channel plan for one open device, with clamping and drops applied.
+
+    A device with no channel rows yields an empty plan: the device is opened and
+    writable on demand, but never sampled, so it stays off the bus until an
+    operator configures the channels to read.
+    """
     limit = len(device.channels)
     if not cfg.channels:
-        interval = _clamp_interval(device_id, cfg.poll_interval_ms, logger)
-        return [DacChannelPlan(channel, interval) for channel in range(limit)]
+        return []
 
     plans: list[DacChannelPlan] = []
     seen: set[int] = set()

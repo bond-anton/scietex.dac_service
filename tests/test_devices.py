@@ -450,26 +450,22 @@ def test_poll_targets_empty_before_first_rebuild(registry: DacDeviceRegistry) ->
     assert registry.settings is None
 
 
-def test_poll_plan_empty_channels_expands_every_output(registry: DacDeviceRegistry, fake_parts: None) -> None:
-    """An empty ``channels`` list samples every HAL output at the device period."""
-    registry.rebuild(DacServiceSettings(devices={"dac0": DacDeviceSettings(type="FAKE", poll_interval_ms=250)}))
+def test_poll_plan_empty_channels_yields_no_plan(registry: DacDeviceRegistry, fake_parts: None) -> None:
+    """A device is silent until channel rows configure it; an empty list samples nothing."""
+    registry.rebuild(DacServiceSettings(devices={"dac0": DacDeviceSettings(type="FAKE")}))
 
     plan = poll_plan(registry)
 
-    assert [entry.channel for entry in plan["dac0"]] == list(range(2))
-    assert {entry.interval_ms for entry in plan["dac0"]} == {250}
-    assert {entry.label for entry in plan["dac0"]} == {None}
-    assert {entry.readback for entry in plan["dac0"]} == {True}
+    assert plan == {}
 
 
-def test_poll_plan_explicit_rows_override_period_and_carry_knobs(registry: DacDeviceRegistry, fake_parts: None) -> None:
+def test_poll_plan_explicit_rows_carry_period_and_knobs(registry: DacDeviceRegistry, fake_parts: None) -> None:
     """A channel row carries its own period and keeps its label and readback."""
     registry.rebuild(
         DacServiceSettings(
             devices={
                 "dac0": DacDeviceSettings(
                     type="FAKE",
-                    poll_interval_ms=1000,
                     channels=[
                         DacChannelSettings(channel=1, poll_interval_ms=100, label="setpoint"),
                         DacChannelSettings(channel=0, readback=False),
@@ -515,8 +511,8 @@ def test_poll_plan_skips_poll_false_and_disabled_service(registry: DacDeviceRegi
     registry.rebuild(
         DacServiceSettings(
             devices={
-                "polled": DacDeviceSettings(type="FAKE"),
-                "manual": DacDeviceSettings(type="FAKE", poll=False),
+                "polled": DacDeviceSettings(type="FAKE", channels=[DacChannelSettings(channel=0)]),
+                "manual": DacDeviceSettings(type="FAKE", poll=False, channels=[DacChannelSettings(channel=0)]),
             }
         )
     )
@@ -526,8 +522,8 @@ def test_poll_plan_skips_poll_false_and_disabled_service(registry: DacDeviceRegi
     registry.rebuild(
         DacServiceSettings(
             devices={
-                "polled": DacDeviceSettings(type="FAKE"),
-                "manual": DacDeviceSettings(type="FAKE", poll=False),
+                "polled": DacDeviceSettings(type="FAKE", channels=[DacChannelSettings(channel=0)]),
+                "manual": DacDeviceSettings(type="FAKE", poll=False, channels=[DacChannelSettings(channel=0)]),
             },
             poll_enabled=False,
         )

@@ -6,7 +6,7 @@ import pytest
 
 from scietex.dac_service import dac_worker as dac_worker_module
 from scietex.dac_service import devices as devices_module
-from scietex.dac_service.config import DAC_SECTION, DacDeviceSettings, DacServiceSettings
+from scietex.dac_service.config import DAC_SECTION, DacChannelSettings, DacDeviceSettings, DacServiceSettings
 from scietex.dac_service.dac_worker import DacWorker
 from scietex.dac_service.devices import DeviceUnavailable
 from scietex.service import TaskProcessor, ValkeyWorker, ValkeyWorkerConfig
@@ -77,7 +77,7 @@ async def test_initialize_fails_when_settings_unresolved(tmp_path, monkeypatch, 
 @pytest.mark.asyncio
 async def test_initialize_opens_devices_from_bootstrap(tmp_path, fake_parts, fake_bootstrap, skip_valkey) -> None:
     """initialize() builds the registry from the merged bootstrap settings."""
-    fake_bootstrap({"devices": {"dac0": {"type": "FAKE", "reference": 3.3}}})
+    fake_bootstrap({"devices": {"dac0": {"type": "FAKE", "reference": 3.3, "channels": [{"channel": 0}]}}})
     worker = _make_worker(tmp_path)
 
     assert await worker.initialize() is True
@@ -152,12 +152,16 @@ async def test_apply_hook_rebuilds_and_logs_after_startup(tmp_path, fake_parts, 
 @pytest.mark.asyncio
 async def test_apply_restarts_the_poll_tasks(tmp_path, fake_parts, fake_bootstrap, skip_valkey) -> None:
     """A reload stops the old generation's task and starts one for the new plan."""
-    fake_bootstrap({"devices": {"dac0": {"type": "FAKE"}}})
+    fake_bootstrap({"devices": {"dac0": {"type": "FAKE", "channels": [{"channel": 0}]}}})
     worker = _make_worker(tmp_path)
     assert await worker.initialize() is True
     old_task = worker.poller.tasks["dac0"]
 
-    worker._apply_settings(DacServiceSettings(devices={"dac0": DacDeviceSettings(type="FAKE", reference=3.3)}))
+    worker._apply_settings(
+        DacServiceSettings(
+            devices={"dac0": DacDeviceSettings(type="FAKE", reference=3.3, channels=[DacChannelSettings(channel=0)])}
+        )
+    )
     await worker._reload_task
 
     assert worker.devices.generation == 2

@@ -55,12 +55,11 @@ class FakeClock:
         self.ms += round(delay_s * 1000)
 
 
-def _settings(*channels: DacChannelSettings, interval_ms: int = 1000, **service) -> DacServiceSettings:
+def _settings(*channels: DacChannelSettings, **service) -> DacServiceSettings:
     return DacServiceSettings(
         devices={
             "dac0": DacDeviceSettings(
                 type="FAKE",
-                poll_interval_ms=interval_ms,
                 channels=list(channels),
             )
         },
@@ -174,7 +173,6 @@ async def test_failed_read_backs_off_and_publishes_nothing(fake_parts) -> None:
     """A failing channel is retried exponentially and never published."""
     settings = _settings(
         DacChannelSettings(channel=0, poll_interval_ms=1000),
-        interval_ms=1000,
         failure_threshold=3,
     )
     client = RecordingStreamClient()
@@ -207,7 +205,7 @@ async def test_failed_read_backs_off_and_publishes_nothing(fake_parts) -> None:
 @pytest.mark.asyncio
 async def test_success_after_failure_publishes_and_resets(fake_parts) -> None:
     """A recovered bus read resets the counter and resumes the stream."""
-    settings = _settings(DacChannelSettings(channel=0), interval_ms=1000, failure_threshold=2)
+    settings = _settings(DacChannelSettings(channel=0), failure_threshold=2)
     client = RecordingStreamClient()
     poller, registry = _poller(settings, client)
     registry.get("dac0").channels = (FakeDacChannel(0, value=5, reference=3.3),)
@@ -277,15 +275,14 @@ async def test_readback_false_never_touches_the_bus(fake_parts) -> None:
     assert client.entries[0][1][2] == (b"code", b"100")
 
 
-def test_plan_expands_empty_channels_to_all_outputs(fake_parts) -> None:
-    """An explicit-channel plan is what the loop consumes; sanity-check the seam."""
-    settings = _settings(interval_ms=250)
+def test_plan_is_empty_without_channel_rows(fake_parts) -> None:
+    """The loop consumes channel rows; an unconfigured device yields no plan."""
+    settings = _settings()
     registry = DacDeviceRegistry(logging.getLogger("test.dac_service.poller.plan"))
     registry.rebuild(settings)
     plan = poll_plan(registry)
 
-    assert [entry.channel for entry in plan["dac0"]] == list(range(2))
-    assert {entry.interval_ms for entry in plan["dac0"]} == {250}
+    assert plan == {}
 
 
 def test_registry_generates_fake_geometry() -> None:

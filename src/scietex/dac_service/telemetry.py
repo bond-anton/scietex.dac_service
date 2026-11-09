@@ -33,8 +33,9 @@ TELEMETRY_INTERVAL: float = 2.0
 TELEMETRY_TTL: int = 6
 
 #: Payload revision: 2 added the service/device states and the per-channel
-#: snapshots on top of the open-device list of revision 1.
-SCHEMA_VERSION: int = 2
+#: snapshots on top of the open-device list of revision 1; 3 added the
+#: per-device ``channel_count`` of a successfully opened part.
+SCHEMA_VERSION: int = 3
 
 
 def _isoformat(value: datetime | None) -> str | None:
@@ -62,12 +63,15 @@ def _device_payload(
     cfg: Any | None,
     state: DacDeviceState | None,
     open_error: str | None,
+    channel_count: int | None,
 ) -> dict[str, Any]:
     """Encode one device's polling state and channel snapshots.
 
     A device that failed to open is an error regardless of the poll snapshot it
     never got: the recorded open error is the reason the operator needs. A
     configured device the poller does not sample reports ``stopped``.
+    ``channel_count`` is the geometry of the open part and is omitted for a
+    device that never opened, where there is no geometry to report.
     """
     if open_error is not None:
         device_state = STATE_ERROR
@@ -78,7 +82,7 @@ def _device_payload(
     else:
         device_state = STATE_STOPPED
         last_error = None
-    return {
+    payload: dict[str, Any] = {
         "state": device_state,
         "type": cfg.type if cfg is not None else None,
         "last_error": last_error,
@@ -87,6 +91,9 @@ def _device_payload(
             str(index): _channel_payload(channel) for index, channel in sorted((state.channels if state else {}).items())
         },
     }
+    if channel_count is not None:
+        payload["channel_count"] = channel_count
+    return payload
 
 
 def _service_state(devices: dict[str, dict[str, Any]]) -> str:
@@ -105,7 +112,9 @@ def build_telemetry(worker: DacWorker) -> dict[str, Any]:
     ``configured`` is False only before the first settings resolution; the
     default struct has no devices but is a valid configuration. A device that
     is configured but failed to open is reported as ``error`` with the recorded
-    reason, so one missing converter does not hide the others.
+    reason, so one missing converter does not hide the others. A successfully
+    opened device also reports its ``channel_count``, the HAL part's output
+    count.
     """
     settings = worker.dac_settings
     registry = worker.devices
@@ -114,7 +123,12 @@ def build_telemetry(worker: DacWorker) -> dict[str, Any]:
     devices: dict[str, dict[str, Any]] = {}
     for device_id in registry.ids():
         cfg = settings.devices.get(device_id) if settings is not None else None
-        devices[device_id] = _device_payload(cfg, states.get(device_id), errors.get(device_id))
+        devices[device_id] = _device_payload(
+            cfg,
+            states.get(device_id),
+            errors.get(device_id),
+            registry.channel_count(device_id),
+        )
     return {
         "service": worker.service_name,
         "instance_id": worker.instance_id,

@@ -108,10 +108,11 @@ that expose them (the AD54x0 family).
 The worker publishes to
 `scietex:DacService:<instance_id>:telemetry` — msgpack, every 2.0 s, with a 6 s
 TTL (so a single missed beat does not expire the key). The snapshot lists every
-configured device with its open state, `type`, and per-channel `code`, `output`,
+configured device with its open state, `type`, `channel_count` (the part's output
+count, omitted when the device never opened), and per-channel `code`, `output`,
 and `unit`. Channel entries come from the in-memory last-written cache; the bus
 is never touched during a telemetry tick, and a channel that was never written
-has no entry.
+has no entry. Telemetry payload revision 3 carries `channel_count`.
 
 ## Documentation
 

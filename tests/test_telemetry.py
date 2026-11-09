@@ -109,6 +109,7 @@ async def test_build_telemetry_reports_channels_and_states(fake_parts) -> None:
     polled = payload["devices"]["dac0"]
     assert polled["state"] == "ok"
     assert polled["type"] == "FAKE"
+    assert polled["channel_count"] == 2
     assert polled["last_error"] is None
     assert polled["last_ok"] is not None
     channel = polled["channels"]["1"]
@@ -119,6 +120,7 @@ async def test_build_telemetry_reports_channels_and_states(fake_parts) -> None:
     assert channel["error"] is None
     stopped = payload["devices"]["dac1"]
     assert stopped["state"] == "stopped"
+    assert stopped["channel_count"] == 2
     assert stopped["channels"] == {}
 
 
@@ -140,6 +142,17 @@ async def test_build_telemetry_reports_open_failure(fake_parts) -> None:
     assert "SPI bus is gone" in device["last_error"]
     assert device["last_ok"] is None
     assert device["channels"] == {}
+    assert "channel_count" not in device
+
+
+def test_channel_count_follows_the_hal_geometry(fake_parts) -> None:
+    """The count is the part's output count, present even before any channel row."""
+    settings = DacServiceSettings(devices={"loop": DacDeviceSettings(type="AD54X0")})
+    registry = _registry(settings)
+
+    payload = build_telemetry(FakeDacWorker(settings=settings, registry=registry, poller=_poller(registry, settings)))
+
+    assert payload["devices"]["loop"]["channel_count"] == 1
 
 
 @pytest.mark.asyncio

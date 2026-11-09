@@ -81,10 +81,13 @@ takes that layer's entry as-is.
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `devices` | mapping | `{}` | Devices keyed by **string** device id |
+| `poll_enabled` | bool | `true` | Service-wide polling switch; `false` stops every poll task |
+| `failure_threshold` | int | `3` | Consecutive failed reads before a device reports `error` |
+| `stream_maxlen` | int | `10000` | Entries retained per readings stream |
 
-There is no service-wide polling switch: DAC telemetry reads an in-memory cache
-and never touches the bus. An empty mapping is a valid configuration — the
-worker starts with no devices and reports an empty `dac:list`.
+Telemetry itself reads an in-memory cache and never touches the bus. An empty
+`devices` mapping is a valid configuration — the worker starts with no devices
+and reports an empty `dac:list`.
 
 Device keys are strings (`dac0`, `pressure-loop`), not integers; the key becomes
 the device's `device_id` in task payloads and telemetry, so the key and the id
@@ -111,10 +114,36 @@ Every entry under `devices` is a `DacDeviceSettings`:
 | `latch_pin` | int or string or null | `null` | Latch GPIO (AD420) |
 | `r_ab` | float or null | `null` | End-to-end resistance in ohms (digital potentiometers) |
 | `grounded` | string or null | `null` | Grounded terminal `A` or `B` (digital potentiometers) |
+| `poll` | bool | `true` | Sample the configured channels; `false` keeps the device writable on demand only |
+| `channels` | list | `[]` | Channel rows to sample; an empty list means the device is never polled |
 
 Fields left unset (`null` or absent) are not forwarded to the HAL constructor, so
 the class default applies; this keeps "not configured" distinct from "explicitly
 disabled".
+
+### Polling
+
+Polling is configured per channel, not per device. A device is sampled only
+through the rows in its `channels` list, and an empty list (the default) leaves
+it silent: it is opened and answers `dac:read`/`dac:write`, but the poll loop
+never touches its bus. A device with `poll: false` is excluded even when it has
+channel rows; the service-wide switch `poll_enabled` turns polling off for every
+device.
+
+Each row is a `DacChannelSettings`:
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `channel` | int | — (required) | Output index to sample |
+| `poll_interval_ms` | int | `2000` | Sampling period for this channel |
+| `enabled` | bool | `true` | `false` drops the row from the plan while keeping the channel writable on demand |
+| `label` | string or null | `null` | Human-readable label carried in the plan |
+| `readback` | bool | `true` | Read the register when the part supports it; `false` always uses the write cache |
+
+A row naming a duplicate or an output the part does not have is dropped with a
+warning instead of failing every tick, and a period outside 100 ms–1 h is
+clamped to that bound with a warning. Requirements come from the constructed
+part, so a two-channel part such as `MCP4251` accepts rows `0` and `1`.
 
 ### Choosing a transport
 
@@ -225,7 +254,7 @@ so a converter that appears later is picked up on the next apply.
 ### Unsupported configuration
 
 Per-channel sequences are deliberately not exposed by the config schema in this
-release. `channels`, `gain`, `power_down`, `buffered`, and a per-channel list for
+release. `gain`, `power_down`, `buffered`, and a per-channel list for
 `reference` are rejected at decode time as unknown fields or a type mismatch;
 `reference` is one scalar for the whole device. Use the task layer — a task
 already addresses one channel by index — for per-channel control.
