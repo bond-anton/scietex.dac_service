@@ -18,9 +18,10 @@ fields.
 
 Per-channel sequences are deliberately out of scope for this file: ``reference``
 is one scalar for the whole device (the HAL accepts a per-channel sequence, but
-the config schema does not), and per-channel ``gain``, ``power_down``,
-``channels``, and ``buffered`` are not exposed at all. Those knobs live on the
-task layer, where a channel index already exists.
+the config schema does not), and the HAL constructor's per-channel ``gain``,
+``power_down``, ``channels``, and ``buffered`` keywords are not exposed at all.
+Those knobs live on the task layer, where a channel index already exists.
+`DacChannelSettings` rows only describe polling, not the HAL geometry.
 
 Device entries are keyed by a **string** device id (``devices: {dac0: {...}}``),
 not an integer. An id names a device in task payloads and telemetry, and a YAML
@@ -46,6 +47,29 @@ DAC_CONFIG_SUBDIR: str = "dac"
 DAC_CONFIG_FILE: str = "dac.yml"
 
 
+class DacChannelSettings(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """One output channel of a device, keyed by its index in the part's geometry.
+
+    ``channel`` is the output index ``dac:read``/``dac:write`` take.
+    ``poll_interval_ms`` is the per-channel sampling period; the device field of
+    the same name is the fallback for a channel with no explicit row.
+    ``enabled=False`` keeps the channel writable on demand while excluding it
+    from the poll plan.
+
+    ``readback`` decides how the poll loop learns the channel's state.
+    ``readback=True`` reads the register when the part supports it and falls
+    back to the write cache on a write-only part. ``readback=False`` always uses
+    the cache and never touches the bus, which is the escape hatch for parts
+    where a register read disturbs the output.
+    """
+
+    channel: int
+    poll_interval_ms: int = 2000
+    enabled: bool = True
+    label: str | None = None
+    readback: bool = True
+
+
 class DacDeviceSettings(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     """One SPI DAC device, keyed by its id in `DacServiceSettings.devices`.
 
@@ -66,6 +90,12 @@ class DacDeviceSettings(msgspec.Struct, frozen=True, forbid_unknown_fields=True)
     while a config entry can only carry YAML scalars. Parts that need a load
     line take ``load_pin`` (or ``latch_pin`` for AD420) as an integer GPIO pin
     instead.
+
+    ``poll`` is service-level, not a HAL argument: it excludes a device from
+    `devices.poll_plan` while keeping it addressable for on-demand writes and
+    reads. ``poll_interval_ms`` is the period for a channel with no explicit
+    `DacChannelSettings` row; an empty ``channels`` list samples every output
+    the HAL part reports at that period.
     """
 
     type: str
@@ -84,12 +114,26 @@ class DacDeviceSettings(msgspec.Struct, frozen=True, forbid_unknown_fields=True)
     latch_pin: int | str | None = None
     r_ab: float | None = None
     grounded: str | None = None
+    poll: bool = True
+    poll_interval_ms: int = 2000
+    channels: list[DacChannelSettings] = msgspec.field(default_factory=list)
 
 
 class DacServiceSettings(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    """Top-level DAC service settings."""
+    """Top-level DAC service settings.
+
+    ``poll_enabled`` is the service-wide polling switch; a device additionally
+    opts out through `DacDeviceSettings.poll`.
+
+    ``failure_threshold`` is the number of consecutive failed reads before a
+    device is reported as ``error`` in telemetry. ``stream_maxlen`` caps the
+    entries retained per readings stream.
+    """
 
     devices: dict[str, DacDeviceSettings] = msgspec.field(default_factory=dict)
+    poll_enabled: bool = True
+    failure_threshold: int = 3
+    stream_maxlen: int = 10000
 
 
 #: Concrete L0 base for the framework's layered merge. A field absent from every

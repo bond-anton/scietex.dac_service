@@ -6,10 +6,13 @@ from dataclasses import replace
 import pytest
 
 from scietex.dac_service import devices
-from scietex.dac_service.config import DacDeviceSettings, DacServiceSettings
+from scietex.dac_service.config import DacChannelSettings, DacDeviceSettings, DacServiceSettings
 from scietex.dac_service.devices import (
     DAC_PARTS,
+    MAX_INTERVAL_MS,
+    MIN_INTERVAL_MS,
     ChannelNotFound,
+    ChannelReading,
     DacDeviceRegistry,
     DeviceNotFound,
     DeviceOpenError,
@@ -19,8 +22,12 @@ from scietex.dac_service.devices import (
     UnknownDeviceType,
     UnknownParameter,
     build_dac,
+    poll_plan,
+    read_cached_channel,
+    read_channel,
 )
 from scietex.hal import dac as hal
+from scietex.hal.dac import DACReadbackError
 
 #: The 23 part names the registry must cover.
 EXPECTED_PARTS = (
@@ -362,14 +369,41 @@ def test_last_written_returns_a_deep_copy(registry: DacDeviceRegistry, fake_part
     assert registry.last_written() == {"dac0": [(0, 10, None)]}
 
 
-def test_rebuild_clears_the_cache_of_replaced_devices(registry: DacDeviceRegistry, fake_parts: None) -> None:
-    """A cached code belongs to the old live object and must not outlive it."""
+def test_rebuild_preserves_the_cache_of_a_surviving_device(registry: DacDeviceRegistry, fake_parts: None) -> None:
+    """A cached code describes the hardware, so a same-type rebuild keeps it."""
     registry.rebuild(DacServiceSettings(devices={"dac0": DacDeviceSettings(type="FAKE")}))
     registry.record_write("dac0", 0, 10, None)
 
     registry.rebuild(DacServiceSettings(devices={"dac0": DacDeviceSettings(type="FAKE", reference=3.3)}))
 
-    assert registry.last_written() == {}
+    assert registry.last_written() == {"dac0": [(0, 10, None)]}
+
+
+def test_rebuild_drops_the_cache_of_a_retyped_or_removed_device(registry: DacDeviceRegistry, fake_parts: None) -> None:
+    """A different part does not hold the old code, and a removed id is gone."""
+    registry.rebuild(
+        DacServiceSettings(
+            devices={
+                "kept": DacDeviceSettings(type="FAKE"),
+                "retyped": DacDeviceSettings(type="FAKE"),
+                "removed": DacDeviceSettings(type="FAKE"),
+            }
+        )
+    )
+    registry.record_write("kept", 0, 1, None)
+    registry.record_write("retyped", 0, 2, None)
+    registry.record_write("removed", 0, 3, None)
+
+    registry.rebuild(
+        DacServiceSettings(
+            devices={
+                "kept": DacDeviceSettings(type="FAKE", reference=3.3),
+                "retyped": DacDeviceSettings(type="WRITEONLY"),
+            }
+        )
+    )
+
+    assert registry.last_written() == {"kept": [(0, 1, None)]}
 
 
 def test_close_clears_the_cache(registry: DacDeviceRegistry, fake_parts: None) -> None:
@@ -379,3 +413,227 @@ def test_close_clears_the_cache(registry: DacDeviceRegistry, fake_parts: None) -
     registry.close()
 
     assert registry.last_written() == {}
+
+
+def test_poll_targets_honours_poll_false(registry: DacDeviceRegistry, fake_parts: None) -> None:
+    """Only devices with ``poll=True`` are polling targets."""
+    registry.rebuild(
+        DacServiceSettings(
+            devices={
+                "polled": DacDeviceSettings(type="FAKE"),
+                "manual": DacDeviceSettings(type="FAKE", poll=False),
+            }
+        )
+    )
+
+    assert [device_id for device_id, _ in registry.poll_targets()] == ["polled"]
+
+
+def test_poll_targets_skips_a_device_that_did_not_open(registry: DacDeviceRegistry, fake_parts: None) -> None:
+    """A configured device with no live object cannot be sampled."""
+    registry.rebuild(
+        DacServiceSettings(
+            devices={
+                "polled": DacDeviceSettings(type="FAKE"),
+                "broken": DacDeviceSettings(type="BROKEN"),
+            }
+        )
+    )
+
+    assert [device_id for device_id, _ in registry.poll_targets()] == ["polled"]
+
+
+def test_poll_targets_empty_before_first_rebuild(registry: DacDeviceRegistry) -> None:
+    """No settings means no polling targets and no known ids."""
+    assert registry.poll_targets() == []
+    assert registry.ids() == []
+    assert registry.settings is None
+
+
+def test_poll_plan_empty_channels_expands_every_output(registry: DacDeviceRegistry, fake_parts: None) -> None:
+    """An empty ``channels`` list samples every HAL output at the device period."""
+    registry.rebuild(DacServiceSettings(devices={"dac0": DacDeviceSettings(type="FAKE", poll_interval_ms=250)}))
+
+    plan = poll_plan(registry)
+
+    assert [entry.channel for entry in plan["dac0"]] == list(range(2))
+    assert {entry.interval_ms for entry in plan["dac0"]} == {250}
+    assert {entry.label for entry in plan["dac0"]} == {None}
+    assert {entry.readback for entry in plan["dac0"]} == {True}
+
+
+def test_poll_plan_explicit_rows_override_period_and_carry_knobs(registry: DacDeviceRegistry, fake_parts: None) -> None:
+    """A channel row carries its own period and keeps its label and readback."""
+    registry.rebuild(
+        DacServiceSettings(
+            devices={
+                "dac0": DacDeviceSettings(
+                    type="FAKE",
+                    poll_interval_ms=1000,
+                    channels=[
+                        DacChannelSettings(channel=1, poll_interval_ms=100, label="setpoint"),
+                        DacChannelSettings(channel=0, readback=False),
+                    ],
+                )
+            }
+        )
+    )
+
+    plan = poll_plan(registry)["dac0"]
+
+    assert [(entry.channel, entry.interval_ms, entry.label, entry.readback) for entry in plan] == [
+        (1, 100, "setpoint", True),
+        (0, 2000, None, False),
+    ]
+
+
+def test_poll_plan_drops_disabled_out_of_range_and_duplicate_rows(registry: DacDeviceRegistry, fake_parts: None) -> None:
+    """A row that cannot be sampled is dropped instead of failing every tick."""
+    registry.rebuild(
+        DacServiceSettings(
+            devices={
+                "dac0": DacDeviceSettings(
+                    type="FAKE",
+                    channels=[
+                        DacChannelSettings(channel=0),
+                        DacChannelSettings(channel=0, poll_interval_ms=200),
+                        DacChannelSettings(channel=1, enabled=False),
+                        DacChannelSettings(channel=99),
+                    ],
+                )
+            }
+        )
+    )
+
+    plan = poll_plan(registry)["dac0"]
+
+    assert [(entry.channel, entry.interval_ms) for entry in plan] == [(0, 2000)]
+
+
+def test_poll_plan_skips_poll_false_and_disabled_service(registry: DacDeviceRegistry, fake_parts: None) -> None:
+    """Neither a device opt-out nor the service switch produces a plan."""
+    registry.rebuild(
+        DacServiceSettings(
+            devices={
+                "polled": DacDeviceSettings(type="FAKE"),
+                "manual": DacDeviceSettings(type="FAKE", poll=False),
+            }
+        )
+    )
+
+    assert list(poll_plan(registry)) == ["polled"]
+
+    registry.rebuild(
+        DacServiceSettings(
+            devices={
+                "polled": DacDeviceSettings(type="FAKE"),
+                "manual": DacDeviceSettings(type="FAKE", poll=False),
+            },
+            poll_enabled=False,
+        )
+    )
+    assert poll_plan(registry) == {}
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        (0, MIN_INTERVAL_MS),
+        (-50, MIN_INTERVAL_MS),
+        (100, 100),
+        (MAX_INTERVAL_MS + 1, MAX_INTERVAL_MS),
+    ],
+)
+def test_poll_plan_clamps_intervals(
+    registry: DacDeviceRegistry,
+    fake_parts: None,
+    caplog: pytest.LogCaptureFixture,
+    configured: int,
+    expected: int,
+) -> None:
+    """A period outside the supported range degrades to the bound with a warning."""
+    registry.rebuild(
+        DacServiceSettings(
+            devices={
+                "dac0": DacDeviceSettings(
+                    type="FAKE",
+                    channels=[DacChannelSettings(channel=0, poll_interval_ms=configured)],
+                )
+            }
+        )
+    )
+
+    plan = poll_plan(registry)["dac0"]
+
+    assert plan[0].interval_ms == expected
+    clamped = configured != expected
+    assert bool(caplog.records) is clamped
+
+
+def test_poll_plan_empty_before_first_rebuild(registry: DacDeviceRegistry) -> None:
+    """No settings means no plan."""
+    assert poll_plan(registry) == {}
+
+
+@pytest.mark.asyncio
+async def test_read_channel_reads_the_register_and_scales_it(registry: DacDeviceRegistry, fake_parts: None) -> None:
+    """A bus read maps the code onto the channel's span."""
+    registry.rebuild(DacServiceSettings(devices={"dac0": DacDeviceSettings(type="FAKE", reference=3.3)}))
+    registry.get("dac0").channels[1].value = 2048
+
+    reading = await read_channel(registry, "dac0", 1)
+
+    assert reading == ChannelReading(device_id="dac0", channel=1, code=2048, output=pytest.approx(2048 * 3.3 / 4095))
+
+
+@pytest.mark.asyncio
+async def test_read_channel_surfaces_the_taxonomy(registry: DacDeviceRegistry, fake_parts: None) -> None:
+    """An unknown id, a bad index, and a write-only part keep their own errors."""
+    registry.rebuild(
+        DacServiceSettings(
+            devices={
+                "dac0": DacDeviceSettings(type="FAKE"),
+                "wo": DacDeviceSettings(type="WRITEONLY"),
+            }
+        )
+    )
+
+    with pytest.raises(DeviceNotFound):
+        await read_channel(registry, "missing", 0)
+    with pytest.raises(ChannelNotFound):
+        await read_channel(registry, "dac0", 9)
+    with pytest.raises(DACReadbackError):
+        await read_channel(registry, "wo", 0)
+
+
+@pytest.mark.asyncio
+async def test_read_cached_channel_answers_from_the_write_cache(registry: DacDeviceRegistry, fake_parts: None) -> None:
+    """The cached code is rescaled against the live span, not the stored output."""
+    registry.rebuild(DacServiceSettings(devices={"dac0": DacDeviceSettings(type="FAKE", reference=3.3)}))
+    registry.record_write("dac0", 0, 100, None)
+
+    reading = await read_cached_channel(registry, "dac0", 0)
+
+    assert reading == ChannelReading(device_id="dac0", channel=0, code=100, output=pytest.approx(100 * 3.3 / 4095))
+
+
+@pytest.mark.asyncio
+async def test_read_cached_channel_has_no_answer_for_an_unwritten_readable_part(
+    registry: DacDeviceRegistry, fake_parts: None
+) -> None:
+    """A readable part with no cached write has no bus-free answer."""
+    registry.rebuild(DacServiceSettings(devices={"dac0": DacDeviceSettings(type="FAKE")}))
+
+    assert await read_cached_channel(registry, "dac0", 0) is None
+
+
+@pytest.mark.asyncio
+async def test_read_cached_channel_falls_back_to_the_shadow_code_of_a_write_only_part(
+    registry: DacDeviceRegistry, fake_parts: None
+) -> None:
+    """A write-only part powers up at zero scale, so its shadow code is the state."""
+    registry.rebuild(DacServiceSettings(devices={"dac0": DacDeviceSettings(type="WRITEONLY")}))
+
+    reading = await read_cached_channel(registry, "dac0", 0)
+
+    assert reading == ChannelReading(device_id="dac0", channel=0, code=0, output=0.0)

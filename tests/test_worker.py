@@ -89,7 +89,9 @@ async def test_initialize_opens_devices_from_bootstrap(tmp_path, fake_parts, fak
     assert worker.devices.settings is settings
     assert worker.devices.ids() == ["dac0"]
     assert worker.devices.get("dac0").reference == 3.3
+    assert list(worker.poller.tasks) == ["dac0"]
     await worker.cleanup()
+    assert worker.poller.tasks == {}
 
 
 @pytest.mark.asyncio
@@ -118,6 +120,7 @@ def test_apply_hook_stores_without_rebuild_before_startup(tmp_path) -> None:
     assert worker.devices.generation == 0
     assert worker.devices.settings is None
     assert worker.devices.ids() == []
+    assert worker._reload_task is None
 
 
 @pytest.mark.asyncio
@@ -136,11 +139,30 @@ async def test_apply_hook_rebuilds_and_logs_after_startup(tmp_path, fake_parts, 
     )
     with caplog.at_level(logging.ERROR):
         worker._apply_settings(applied)
+        # The hook only schedules the reload; the rebuild runs as a task.
+        await worker._reload_task
 
     assert worker.dac_settings is applied
     assert worker.devices.generation == 2
     assert worker.devices.ids() == ["a", "broken"]
     assert any("SPI bus is gone" in record.message for record in caplog.records)
+    await worker.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_apply_restarts_the_poll_tasks(tmp_path, fake_parts, fake_bootstrap, skip_valkey) -> None:
+    """A reload stops the old generation's task and starts one for the new plan."""
+    fake_bootstrap({"devices": {"dac0": {"type": "FAKE"}}})
+    worker = _make_worker(tmp_path)
+    assert await worker.initialize() is True
+    old_task = worker.poller.tasks["dac0"]
+
+    worker._apply_settings(DacServiceSettings(devices={"dac0": DacDeviceSettings(type="FAKE", reference=3.3)}))
+    await worker._reload_task
+
+    assert worker.devices.generation == 2
+    assert worker.poller.tasks["dac0"] is not old_task
+    assert old_task.cancelled() or old_task.done()
     await worker.cleanup()
 
 
@@ -162,6 +184,7 @@ async def test_identical_settings_skip_the_rebuild(tmp_path, fake_parts, fake_bo
     assert worker.devices.generation == 1
 
     worker._apply_settings(worker.dac_settings)
+    await worker._reload_task
 
     assert opened == ["dac0"]
     assert worker.devices.generation == 1

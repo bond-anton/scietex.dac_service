@@ -1,139 +1,127 @@
 """Telemetry payloads the DAC worker publishes to Valkey.
 
-The snapshot reports which configured converters are actually open and the
-channel state left by the last successful write, so an operator sees a device
-disappear or a write land without the worker going down. The key shape, push
-interval, and TTL are the frozen contract: key
+The snapshot reports the polling state of every configured device and the last
+outcome of each sampled output, so the UI can tell an operator that a converter
+disappeared, or that a bus fault appeared and cleared, without watching the
+readings streams. The payload is a plain mapping because both sides key devices
+and channels by ids from the configuration, not by struct fields.
+
+The key shape, push interval, and TTL are the frozen contract: key
 ``scietex:{service}:{instance_id}:telemetry`` (the ``telemetry`` suffix never
 matches the heartbeat discovery glob ``scietex:*:*:status``), pushed every 2 s
 with a 6 s TTL.
 
-Unlike the ADC snapshot, nothing here goes to the bus: channel state comes from
-`DacDeviceRegistry.last_written`, the cache `dac:write` fills after a write, and
-the unit is read from the live channel object, which is a local property. A
-telemetry tick therefore cannot disturb an in-flight write, and a write-only
-part (no readback) still reports state.
+Building the payload never touches the bus: the channel snapshot is filled by
+the poll loop from register reads, cached writes, and write results, and the
+builder only reads it.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-import msgspec
-
-from .devices import DeviceUnavailable
+from .poller import STATE_ERROR, STATE_OK, STATE_STOPPED
 
 if TYPE_CHECKING:
-    from .config import DacServiceSettings
-    from .devices import DacDeviceRegistry
+    from .dac_worker import DacWorker
+    from .poller import DacChannelState, DacDeviceState
 
 #: Push cadence and key TTL: 2 s interval, 6 s TTL so a single missed beat does
 #: not expire the key.
 TELEMETRY_INTERVAL: float = 2.0
 TELEMETRY_TTL: int = 6
 
-
-class DacChannelTelemetry(msgspec.Struct, frozen=True):
-    """State one successful write left a channel in."""
-
-    channel: int
-    code: int | None
-    output: float | None
-    unit: str | None
+#: Payload revision: 2 added the service/device states and the per-channel
+#: snapshots on top of the open-device list of revision 1.
+SCHEMA_VERSION: int = 2
 
 
-class DacDeviceTelemetry(msgspec.Struct, frozen=True):
-    """Open state and written channels of one configured device."""
-
-    device_id: str
-    type: str
-    available: bool
-    error: str | None = None
-    channels: list[DacChannelTelemetry] = msgspec.field(default_factory=list)
+def _isoformat(value: datetime | None) -> str | None:
+    """Render a timestamp as ISO-8601, keeping ``None`` distinguishable from ""."""
+    return value.isoformat() if value is not None else None
 
 
-class DacServiceTelemetry(msgspec.Struct, frozen=True):
-    """Telemetry snapshot pushed by the DAC worker.
+def _channel_payload(state: DacChannelState) -> dict[str, Any]:
+    """Encode one channel's last outcome for the payload.
+
+    ``value`` mirrors ``code`` as a float for charting; ``output`` stays ``None``
+    when the part has no reference or is write-only, so the UI renders a dash
+    instead of a fake zero.
+    """
+    return {
+        "value": state.value,
+        "code": state.code,
+        "output": state.output,
+        "ts": _isoformat(state.ts),
+        "error": state.error,
+    }
+
+
+def _device_payload(
+    cfg: Any | None,
+    state: DacDeviceState | None,
+    open_error: str | None,
+) -> dict[str, Any]:
+    """Encode one device's polling state and channel snapshots.
+
+    A device that failed to open is an error regardless of the poll snapshot it
+    never got: the recorded open error is the reason the operator needs. A
+    configured device the poller does not sample reports ``stopped``.
+    """
+    if open_error is not None:
+        device_state = STATE_ERROR
+        last_error = open_error
+    elif state is not None:
+        device_state = state.state
+        last_error = state.last_error
+    else:
+        device_state = STATE_STOPPED
+        last_error = None
+    return {
+        "state": device_state,
+        "type": cfg.type if cfg is not None else None,
+        "last_error": last_error,
+        "last_ok": _isoformat(state.last_ok if state is not None else None),
+        "channels": {
+            str(index): _channel_payload(channel) for index, channel in sorted((state.channels if state else {}).items())
+        },
+    }
+
+
+def _service_state(devices: dict[str, dict[str, Any]]) -> str:
+    """Aggregate the device states: any error wins, then any live device."""
+    states = {entry["state"] for entry in devices.values()}
+    if STATE_ERROR in states:
+        return STATE_ERROR
+    if STATE_OK in states:
+        return STATE_OK
+    return STATE_STOPPED
+
+
+def build_telemetry(worker: DacWorker) -> dict[str, Any]:
+    """Snapshot the worker's settings, registry, and poll snapshots.
 
     ``configured`` is False only before the first settings resolution; the
-    default struct has no devices but is a valid configuration.
+    default struct has no devices but is a valid configuration. A device that
+    is configured but failed to open is reported as ``error`` with the recorded
+    reason, so one missing converter does not hide the others.
     """
-
-    service: str
-    instance_id: str
-    configured: bool
-    devices: list[DacDeviceTelemetry]
-    timestamp: datetime = msgspec.field(default_factory=lambda: datetime.now(timezone.utc))
-    schema_version: int = 1
-
-
-def build_telemetry(
-    settings: DacServiceSettings | None,
-    registry: DacDeviceRegistry,
-    *,
-    service: str,
-    instance_id: str,
-) -> DacServiceTelemetry:
-    """Snapshot the effective settings and the live device registry.
-
-    Pure with respect to the hardware: a device that is configured but failed to
-    open is reported with ``available=False`` and the reason recorded by the
-    registry, while an open device reports the channels the registry cached
-    after a write. A device that was never written reports no channels at all
-    rather than fabricated zeros, so "not written yet" stays distinguishable
-    from "written zero". A worker before startup reports ``configured=False``
-    with an empty device list.
-
-    Args:
-        settings: The effective settings, or ``None`` before startup.
-        registry: The live device registry shared with the task handlers.
-        service: Service name the snapshot is published under.
-        instance_id: Worker instance the snapshot was taken from.
-
-    Returns:
-        The snapshot, ready for msgpack encoding.
-    """
-    if settings is None:
-        return DacServiceTelemetry(service=service, instance_id=instance_id, configured=False, devices=[])
-
+    settings = worker.dac_settings
+    registry = worker.devices
+    states = worker.poller.states
     errors = registry.errors
-    written = registry.last_written()
-    devices: list[DacDeviceTelemetry] = []
+    devices: dict[str, dict[str, Any]] = {}
     for device_id in registry.ids():
-        cfg = settings.devices.get(device_id)
-        device_type = cfg.type if cfg is not None else ""
-        try:
-            device = registry.get(device_id)
-        except DeviceUnavailable:
-            devices.append(
-                DacDeviceTelemetry(
-                    device_id=device_id,
-                    type=device_type,
-                    available=False,
-                    error=errors.get(device_id),
-                )
-            )
-            continue
-        # A local property, not a bus read: every channel of a part shares the
-        # unit, so the first one is enough for the cached channel entries. A
-        # channel-less part (a digital potentiometer) has no unit to report.
-        unit = str(device.channels[0].unit) if device.channels else None
-        channels = [
-            DacChannelTelemetry(channel=channel, code=code, output=output, unit=unit)
-            for channel, code, output in written.get(device_id, [])
-        ]
-        devices.append(
-            DacDeviceTelemetry(
-                device_id=device_id,
-                type=device_type,
-                available=True,
-                channels=channels,
-            )
-        )
-    return DacServiceTelemetry(
-        service=service,
-        instance_id=instance_id,
-        configured=True,
-        devices=devices,
-    )
+        cfg = settings.devices.get(device_id) if settings is not None else None
+        devices[device_id] = _device_payload(cfg, states.get(device_id), errors.get(device_id))
+    return {
+        "service": worker.service_name,
+        "instance_id": worker.instance_id,
+        "configured": settings is not None,
+        "poll_enabled": settings.poll_enabled if settings is not None else True,
+        "state": _service_state(devices),
+        "devices": devices,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "schema_version": SCHEMA_VERSION,
+    }

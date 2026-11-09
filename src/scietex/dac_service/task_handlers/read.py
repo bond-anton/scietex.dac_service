@@ -1,8 +1,10 @@
 """``dac:read`` data-plane task: read one channel's raw code back.
 
 The handler reads the live device at request time; nothing is cached, so the
-result is the bus state at the moment the task ran. A part that cannot report
-its registers raises `DACReadbackError` from `DACChannel.readback`, which the
+result is the bus state at the moment the task ran. It goes through
+`devices.read_channel`, the same helper the poll loop uses, so an on-demand and
+a polled value come from the same accessor and share the per-device bus lock. A
+part that cannot report its registers raises `DACReadbackError`, which the
 shared error table maps to a non-retryable ``DAC_READBACK_ERROR``; the handler
 does not pre-check `readable` and synthesize the code itself.
 """
@@ -19,7 +21,7 @@ from scietex.service.task_handler import (
     TaskResult,
 )
 
-from ..devices import DacDeviceRegistry
+from ..devices import DacDeviceRegistry, read_channel
 from ._request import decode_request, error_result, ok_result
 
 #: Task name for a single-channel read.
@@ -85,14 +87,14 @@ class DacReadHandler(TaskHandler):
         try:
             request = decode_request(task_data, DacReadRequest)
             channel = self._devices.channel(request.device_id, request.channel)
-            code = channel.readback()
+            reading = await read_channel(self._devices, request.device_id, request.channel)
         except Exception as exc:
             return error_result(exc)
         return ok_result(
             DacReadResponse(
                 device_id=request.device_id,
                 channel=request.channel,
-                code=code,
+                code=reading.code,
                 unit=str(channel.unit),
                 reference=channel.reference,
                 max_code=channel.max_code,

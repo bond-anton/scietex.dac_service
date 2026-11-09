@@ -1,6 +1,6 @@
 """Minimal worker and Valkey-client doubles for telemetry tests.
 
-`build_telemetry` takes the settings, the registry, and the service identity
+`build_telemetry` takes the settings, the registry, and the poll snapshots
 separately, so a real `DacWorker` is unnecessary for payload-shape tests. The
 client doubles record or fail the single ``set`` call the Telemetry manager
 makes.
@@ -9,6 +9,7 @@ makes.
 import logging
 
 from scietex.dac_service.devices import DacDeviceRegistry
+from scietex.dac_service.poller import DacPoller
 
 
 class FakeDacWorker:
@@ -19,6 +20,7 @@ class FakeDacWorker:
         *,
         settings=None,
         registry: DacDeviceRegistry | None = None,
+        poller: DacPoller | None = None,
         service_name: str = "dac-test",
         instance_id: str = "instance-1",
     ) -> None:
@@ -27,6 +29,16 @@ class FakeDacWorker:
         self.dac_settings = settings
         self.devices = (
             registry if registry is not None else DacDeviceRegistry(logging.getLogger("test.dac_service.fake_worker"))
+        )
+        self.poller = (
+            poller
+            if poller is not None
+            else DacPoller(
+                self.devices,
+                logging.getLogger("test.dac_service.fake_worker.poller"),
+                service_name=service_name,
+                instance_id=instance_id,
+            )
         )
 
 

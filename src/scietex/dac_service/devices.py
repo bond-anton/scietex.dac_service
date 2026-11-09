@@ -8,10 +8,17 @@ settings change, and records a per-device failure in `errors` rather than
 raising, so one unplugged converter never keeps the rest of the service from
 starting.
 
-The registry is synchronous and not thread-safe: the worker drives it from one
-task, and the HAL bus transactions are blocking by design.
+`poll_plan` turns the settings plus the live geometry into the per-device,
+per-channel sampling plan the poll loop consumes. `read_channel` reads a register
+over the bus and `read_cached_channel` answers from the write cache; both share
+`ChannelReading`, so a polled, an on-demand, and a just-written value are scaled
+the same way. Bus reads take the per-device lock so the poll loop and an
+on-demand task never interleave two SPI transactions on one chip select. The
+registry itself stays synchronous and not thread-safe; the HAL reads are
+blocking bus transactions by design.
 """
 
+import asyncio
 import inspect
 import logging
 from collections.abc import Mapping
@@ -20,6 +27,14 @@ from dataclasses import dataclass
 from scietex.hal import dac as hal
 
 from .config import DacDeviceSettings, DacServiceSettings
+
+#: Hard bounds on a sampling period. Below 100 ms one converter's blocking
+#: transaction would starve the event loop; above an hour the cadence is
+#: indistinguishable from polling being off.
+MIN_INTERVAL_MS: int = 100
+MAX_INTERVAL_MS: int = 3_600_000
+
+_LOG = logging.getLogger(__name__)
 
 
 class DeviceConfigError(ValueError):
@@ -215,6 +230,10 @@ class DacDeviceRegistry:
         self._settings: DacServiceSettings | None = None
         self._generation = 0
         self._last_written: dict[str, dict[int, tuple[int, float | None]]] = {}
+        # One bus lock per device id, shared by the poll loop and the task
+        # handlers. An SPI transaction is not re-entrant on a chip select, so
+        # two readers of the same converter must queue, not interleave.
+        self._locks: dict[str, asyncio.Lock] = {}
 
     @property
     def errors(self) -> Mapping[str, str]:
@@ -256,9 +275,17 @@ class DacDeviceRegistry:
                 dev.close()
             except Exception as exc:
                 self._log.warning("Error closing %s: %s", device_id, exc)
-            # A rebuild replaces the live object, so a code cached against the
-            # old object must not outlive it.
-            self._last_written.pop(device_id, None)
+        # A cached code describes the hardware, not the live object, so it
+        # outlives a rebuild of the same part. A removed device or a changed
+        # ``type`` invalidated the code: a different part does not hold it.
+        previous = self._settings.devices if self._settings is not None else {}
+        self._last_written = {
+            device_id: channels
+            for device_id, channels in self._last_written.items()
+            if device_id in settings.devices
+            and device_id in previous
+            and previous[device_id].type == settings.devices[device_id].type
+        }
         for device_id, cfg in settings.devices.items():
             try:
                 self._devices[device_id] = build_dac(device_id, cfg)
@@ -334,6 +361,33 @@ class DacDeviceRegistry:
         """
         return self.get(device_id).channels
 
+    def poll_targets(self) -> list[tuple[str, hal.DAC]]:
+        """Open devices whose settings entry has ``poll=True``, in settings order."""
+        if self._settings is None:
+            return []
+        return [
+            (device_id, self._devices[device_id])
+            for device_id, cfg in self._settings.devices.items()
+            if cfg.poll and device_id in self._devices
+        ]
+
+    def read_lock(self, device_id: str) -> asyncio.Lock:
+        """Return the bus lock serializing reads of ``device_id``.
+
+        The lock is created on first use and kept across rebuilds: a rebuild
+        runs only after the poll tasks are stopped, so no reader is holding it
+        when the device object is replaced.
+        """
+        lock = self._locks.get(device_id)
+        if lock is None:
+            lock = self._locks[device_id] = asyncio.Lock()
+        return lock
+
+    def last_written_channel(self, device_id: str, channel: int) -> tuple[int, float | None] | None:
+        """Return ``(code, output)`` cached by the last successful write, if any."""
+        cached = self._last_written.get(device_id)
+        return None if cached is None else cached.get(channel)
+
     def record_write(self, device_id: str, channel: int, code: int, output: float | None) -> None:
         """Cache the state a successful write left one channel in.
 
@@ -361,3 +415,192 @@ class DacDeviceRegistry:
             device_id: [(channel, code, output) for channel, (code, output) in sorted(channels.items())]
             for device_id, channels in sorted(self._last_written.items())
         }
+
+
+@dataclass(frozen=True)
+class ChannelReading:
+    """One channel's state: the raw code and the output it maps to."""
+
+    device_id: str
+    channel: int
+    code: int
+    output: float | None
+
+
+def _output_for_code(channel: hal.DACChannel, code: int) -> float | None:
+    """Scale ``code`` onto the channel's span without touching the bus.
+
+    ``DACChannel.output`` would ask a readable part for its register again, so
+    the span is applied here from the same public bounds it uses. Every part in
+    `DAC_PARTS` maps code linearly onto ``lower_bound..reference``; a divider
+    with an inverted curve is not among them.
+    """
+    reference = channel.reference
+    if reference is None:
+        return None
+    lower = channel.lower_bound
+    level = lower + code / channel.max_code * (reference - lower)
+    return min(max(level, lower), reference)
+
+
+def _reading(device_id: str, channel: int, code: int, hal_channel: hal.DACChannel) -> ChannelReading:
+    """Pair a code with the output the channel's current span gives it."""
+    return ChannelReading(
+        device_id=device_id,
+        channel=channel,
+        code=code,
+        output=_output_for_code(hal_channel, code),
+    )
+
+
+async def read_channel(
+    registry: DacDeviceRegistry,
+    device_id: str,
+    index: int,
+) -> ChannelReading:
+    """Read one register over the bus under the device's lock.
+
+    This is the single bus read path shared by the poll loop and ``dac:read``,
+    so a polled and an on-demand value come from the same accessor. The device
+    is resolved before the lock is taken, so an unknown or unavailable id never
+    waits behind a slow bus transaction.
+
+    Raises:
+        DeviceNotFound: No device is configured under ``device_id``.
+        DeviceUnavailable: The device is configured but not open.
+        ChannelNotFound: The device has no output at ``index``.
+        DACReadbackError: The part cannot report its registers.
+    """
+    registry.get(device_id)
+    async with registry.read_lock(device_id):
+        hal_channel = registry.channel(device_id, index)
+        code = hal_channel.readback()
+    return _reading(device_id, index, code, hal_channel)
+
+
+async def read_cached_channel(
+    registry: DacDeviceRegistry,
+    device_id: str,
+    index: int,
+) -> ChannelReading | None:
+    """Answer from the write cache without touching the bus.
+
+    A write-only part that was never written falls back to its HAL shadow code:
+    the parts in scope power up at zero scale, so that is the state the hardware
+    holds rather than a guess. A readable part with ``readback=False`` and no
+    cached write has no bus-free answer, so the result is ``None`` and the poll
+    loop publishes nothing until the next write.
+
+    Raises:
+        DeviceNotFound: No device is configured under ``device_id``.
+        DeviceUnavailable: The device is configured but not open.
+        ChannelNotFound: The device has no output at ``index``.
+    """
+    hal_channel = registry.channel(device_id, index)
+    cached = registry.last_written_channel(device_id, index)
+    if cached is not None:
+        return _reading(device_id, index, cached[0], hal_channel)
+    if not hal_channel.readable:
+        return _reading(device_id, index, hal_channel.value, hal_channel)
+    return None
+
+
+@dataclass(frozen=True)
+class DacChannelPlan:
+    """One channel the poll loop samples: index, period, label, and source."""
+
+    channel: int
+    interval_ms: int
+    label: str | None = None
+    readback: bool = True
+
+
+def poll_plan(
+    registry: DacDeviceRegistry,
+    logger: logging.Logger | None = None,
+) -> dict[str, list[DacChannelPlan]]:
+    """Expand the settings and the live geometry into the sampling plan.
+
+    The device subset comes from `DacDeviceRegistry.poll_targets`, so a device
+    with ``poll=False``, an unopened device, and (service-wide)
+    ``poll_enabled=False`` never reach the plan. Per device:
+
+    * an empty ``channels`` list samples every output the HAL part reports, at
+      the device ``poll_interval_ms``;
+    * an explicit channel row overrides that period and an ``enabled=False``
+      row is dropped;
+    * a row naming an output the part does not have is dropped with a warning,
+      because it could only fail on every tick;
+    * every period is clamped to ``[MIN_INTERVAL_MS, MAX_INTERVAL_MS]`` with a
+      warning, so a misconfigured value degrades instead of starving the loop.
+
+    Returns:
+        Device id -> channels to sample. A device with no sampleable channel is
+        absent, and so is every device when polling is disabled.
+    """
+    settings = registry.settings
+    if settings is None or not settings.poll_enabled:
+        return {}
+    log = logger if logger is not None else _LOG
+    plan: dict[str, list[DacChannelPlan]] = {}
+    for device_id, device in registry.poll_targets():
+        cfg = settings.devices[device_id]
+        channels = _device_plan(device_id, device, cfg, log)
+        if channels:
+            plan[device_id] = channels
+    return plan
+
+
+def _device_plan(
+    device_id: str,
+    device: hal.DAC,
+    cfg: DacDeviceSettings,
+    logger: logging.Logger,
+) -> list[DacChannelPlan]:
+    """Per-channel plan for one open device, with clamping and drops applied."""
+    limit = len(device.channels)
+    if not cfg.channels:
+        interval = _clamp_interval(device_id, cfg.poll_interval_ms, logger)
+        return [DacChannelPlan(channel, interval) for channel in range(limit)]
+
+    plans: list[DacChannelPlan] = []
+    seen: set[int] = set()
+    for entry in cfg.channels:
+        if not entry.enabled:
+            continue
+        if entry.channel in seen:
+            logger.warning("Device %s: duplicate channel %d row ignored", device_id, entry.channel)
+            continue
+        if not 0 <= entry.channel < limit:
+            logger.warning(
+                "Device %s: channel %d is outside the part's %d outputs",
+                device_id,
+                entry.channel,
+                limit,
+            )
+            continue
+        seen.add(entry.channel)
+        plans.append(
+            DacChannelPlan(
+                channel=entry.channel,
+                interval_ms=_clamp_interval(device_id, entry.poll_interval_ms, logger),
+                label=entry.label,
+                readback=entry.readback,
+            )
+        )
+    return plans
+
+
+def _clamp_interval(device_id: str, interval_ms: int, logger: logging.Logger) -> int:
+    """Clamp one sampling period into the supported range, warning on a change."""
+    clamped = min(max(interval_ms, MIN_INTERVAL_MS), MAX_INTERVAL_MS)
+    if clamped != interval_ms:
+        logger.warning(
+            "Device %s: poll_interval_ms=%d is outside [%d, %d]; using %d",
+            device_id,
+            interval_ms,
+            MIN_INTERVAL_MS,
+            MAX_INTERVAL_MS,
+            clamped,
+        )
+    return clamped

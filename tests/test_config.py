@@ -9,6 +9,7 @@ from scietex.dac_service.config import (
     DAC_CONFIG_FILE,
     DAC_CONFIG_SUBDIR,
     DAC_SETTINGS_DEFAULTS,
+    DacChannelSettings,
     DacDeviceSettings,
     DacServiceSettings,
     read_dac_config,
@@ -175,3 +176,44 @@ def test_reference_is_scalar_not_a_sequence() -> None:
     """Per-channel ``reference`` sequences are out of scope: only a scalar is valid."""
     with pytest.raises(msgspec.ValidationError):
         msgspec.convert({"type": "MCP4822", "reference": [2.048, 4.096]}, DacDeviceSettings)
+
+
+def test_channel_row_decodes_from_a_yaml_shaped_mapping() -> None:
+    """A channel row is the polling description, so all of it round-trips."""
+    settings = msgspec.convert(
+        {"type": "MCP4822", "channels": [{"channel": 1, "poll_interval_ms": 250, "label": "setpoint"}]},
+        DacDeviceSettings,
+    )
+
+    assert settings.channels == [DacChannelSettings(channel=1, poll_interval_ms=250, label="setpoint")]
+
+
+def test_channel_row_defaults_keep_a_bare_row_valid() -> None:
+    """Only the index is required; the rest falls back to the polling defaults."""
+    [row] = msgspec.convert({"type": "MCP4822", "channels": [{"channel": 0}]}, DacDeviceSettings).channels
+
+    assert (row.poll_interval_ms, row.enabled, row.label, row.readback) == (2000, True, None, True)
+
+
+def test_channel_row_rejects_an_unknown_field() -> None:
+    """A misspelt channel knob fails validation instead of being ignored."""
+    with pytest.raises(msgspec.ValidationError):
+        msgspec.convert({"type": "MCP4822", "channels": [{"channel": 0, "interval": 100}]}, DacDeviceSettings)
+
+
+def test_device_polling_fields_default_so_an_old_entry_still_decodes() -> None:
+    """A ``dac.yml`` written before polling existed parses with the poll defaults."""
+    settings = msgspec.convert({"type": "MCP4822"}, DacDeviceSettings)
+
+    assert settings.poll is True
+    assert settings.poll_interval_ms == 2000
+    assert settings.channels == []
+
+
+def test_service_polling_fields_default() -> None:
+    """The service-wide polling knobs have concrete defaults."""
+    settings = DacServiceSettings()
+
+    assert settings.poll_enabled is True
+    assert settings.failure_threshold == 3
+    assert settings.stream_maxlen == 10000

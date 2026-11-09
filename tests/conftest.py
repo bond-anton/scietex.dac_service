@@ -34,6 +34,9 @@ class FakeDacChannel:
         self._reference = reference
         self.grounded = grounded
         self.readable = readable
+        #: Output floor code 0 maps to. Every fake part is a plain voltage or
+        #: current output, so the span starts at zero.
+        self.lower_bound = 0.0
         #: When set, the next code write raises it, standing in for a channel
         #: whose output is disabled or whose bus rejects the frame.
         self.write_error: Exception | None = None
@@ -303,6 +306,22 @@ class StubbornCloseDAC(FakeDAC):
 
     def close(self) -> None:
         raise OSError("already gone")
+
+
+class RecordingStreamClient:
+    """Valkey client double that records every ``xadd``."""
+
+    def __init__(self) -> None:
+        self.entries: list[tuple[str, list[tuple[bytes, bytes]], object]] = []
+
+    async def xadd(self, key, fields, options=None):
+        self.entries.append((key, fields, options))
+
+    def keys(self) -> list[str]:
+        return [key for key, _, _ in self.entries]
+
+    def count(self, key: str) -> int:
+        return sum(1 for entry_key in self.keys() if entry_key == key)
 
 
 @pytest.fixture

@@ -1,24 +1,38 @@
 """Tests for the DAC telemetry payload builder and the Telemetry manager loop."""
 
 import logging
-from unittest.mock import Mock
 
 import msgspec
 import pytest
+from conftest import FakeDacChannel
 from fake_worker import FailingClient, FakeDacWorker, RecordingClient
 from glide import ExpiryType, RequestError
 
+from scietex.dac_service import telemetry as telemetry_module
 from scietex.dac_service.config import DacDeviceSettings, DacServiceSettings
 from scietex.dac_service.dac_worker import DacWorker
 from scietex.dac_service.devices import DacDeviceRegistry
+from scietex.dac_service.poller import DacPoller
 from scietex.dac_service.telemetry import (
+    SCHEMA_VERSION,
     TELEMETRY_INTERVAL,
     TELEMETRY_TTL,
-    DacChannelTelemetry,
-    DacServiceTelemetry,
     build_telemetry,
 )
 from scietex.service import ValkeyWorkerConfig
+
+
+class ToggleChannel(FakeDacChannel):
+    """Channel double whose register read fails while ``exc`` is set."""
+
+    def __init__(self, code: int = 0) -> None:
+        super().__init__(0, value=code)
+        self.exc: Exception | None = None
+
+    def readback(self) -> int:
+        if self.exc is not None:
+            raise self.exc
+        return super().readback()
 
 
 def _registry(settings: DacServiceSettings) -> DacDeviceRegistry:
@@ -27,14 +41,16 @@ def _registry(settings: DacServiceSettings) -> DacDeviceRegistry:
     return registry
 
 
-def _telemetry(worker: FakeDacWorker) -> DacServiceTelemetry:
-    """Build a snapshot from the fake's four attributes."""
-    return build_telemetry(
-        worker.dac_settings,
-        worker.devices,
-        service=worker.service_name,
-        instance_id=worker.instance_id,
+def _poller(registry: DacDeviceRegistry, settings: DacServiceSettings, **kwargs) -> DacPoller:
+    poller = DacPoller(
+        registry,
+        logging.getLogger("test.dac_service.telemetry.poller"),
+        service_name="dac-test",
+        instance_id="instance-1",
+        **kwargs,
     )
+    poller.configure(settings)
+    return poller
 
 
 def _make_worker(tmp_path) -> DacWorker:
@@ -54,91 +70,145 @@ def test_telemetry_interval_and_ttl() -> None:
     assert TELEMETRY_TTL == 6
 
 
-def test_unconfigured_snapshot_is_empty_and_encodes() -> None:
-    """A pre-startup snapshot reports configured=False and survives msgpack."""
-    telemetry = _telemetry(FakeDacWorker())
+def test_build_telemetry_before_initialize_is_unconfigured() -> None:
+    """A pre-startup worker reports configured=False with no devices."""
+    payload = build_telemetry(FakeDacWorker())
 
-    assert telemetry.service == "dac-test"
-    assert telemetry.instance_id == "instance-1"
-    assert telemetry.configured is False
-    assert telemetry.devices == []
-    assert telemetry.schema_version == 1
-    assert msgspec.msgpack.decode(msgspec.msgpack.encode(telemetry), type=DacServiceTelemetry) == telemetry
+    assert payload["service"] == "dac-test"
+    assert payload["instance_id"] == "instance-1"
+    assert payload["configured"] is False
+    assert payload["poll_enabled"] is True
+    assert payload["state"] == "stopped"
+    assert payload["devices"] == {}
+    assert payload["schema_version"] == SCHEMA_VERSION
 
 
-def test_snapshot_reports_the_last_written_channel(fake_parts) -> None:
-    """An open device reports the channel state its last write left behind."""
-    settings = DacServiceSettings(devices={"dac0": DacDeviceSettings(type="FAKE", reference=3.3)})
+@pytest.mark.asyncio
+async def test_build_telemetry_reports_channels_and_states(fake_parts) -> None:
+    """A polled device reports its state, type, and per-channel snapshots."""
+    settings = DacServiceSettings(
+        devices={
+            "dac1": DacDeviceSettings(type="FAKE", poll=False),
+            "dac0": DacDeviceSettings(type="FAKE", reference=10.24),
+        }
+    )
     registry = _registry(settings)
-    registry.record_write("dac0", 1, 1234, 1.5)
+    poller = _poller(registry, settings)
+    registry.get("dac0").channels[1].value = 512
+    await poller.start()
+    try:
+        assert await poller._read_and_publish("dac0", 1) is True
+    finally:
+        await poller.stop()
 
-    telemetry = _telemetry(FakeDacWorker(settings=settings, registry=registry))
+    payload = build_telemetry(FakeDacWorker(settings=settings, registry=registry, poller=poller))
 
-    assert telemetry.configured is True
-    [device] = telemetry.devices
-    assert device.device_id == "dac0"
-    assert device.type == "FAKE"
-    assert device.available is True
-    assert device.error is None
-    assert device.channels == [DacChannelTelemetry(channel=1, code=1234, output=1.5, unit="V")]
+    assert payload["configured"] is True
+    assert payload["state"] == "ok"
+    assert list(payload["devices"]) == ["dac0", "dac1"]
+    polled = payload["devices"]["dac0"]
+    assert polled["state"] == "ok"
+    assert polled["type"] == "FAKE"
+    assert polled["last_error"] is None
+    assert polled["last_ok"] is not None
+    channel = polled["channels"]["1"]
+    assert channel["value"] == 512.0
+    assert channel["code"] == 512
+    assert channel["output"] == pytest.approx(512 * 10.24 / 4095)
+    assert channel["ts"] is not None
+    assert channel["error"] is None
+    stopped = payload["devices"]["dac1"]
+    assert stopped["state"] == "stopped"
+    assert stopped["channels"] == {}
 
 
-def test_device_without_writes_reports_no_channels(fake_parts) -> None:
-    """A device that was never written has an empty channel list, not zeros."""
+@pytest.mark.asyncio
+async def test_build_telemetry_reports_open_failure(fake_parts) -> None:
+    """A configured device that failed to open is reported as an error."""
+    settings = DacServiceSettings(devices={"dac0": DacDeviceSettings(type="BROKEN")})
+    registry = _registry(settings)
+    poller = _poller(registry, settings)
+    await poller.start()
+    await poller.stop()
+
+    payload = build_telemetry(FakeDacWorker(settings=settings, registry=registry, poller=poller))
+
+    assert payload["state"] == "error"
+    device = payload["devices"]["dac0"]
+    assert device["state"] == "error"
+    assert device["type"] == "BROKEN"
+    assert "SPI bus is gone" in device["last_error"]
+    assert device["last_ok"] is None
+    assert device["channels"] == {}
+
+
+@pytest.mark.asyncio
+async def test_output_stays_none_without_reference(fake_parts) -> None:
+    """An unscaled channel reports a null output, never a zero."""
     settings = DacServiceSettings(devices={"dac0": DacDeviceSettings(type="FAKE")})
-
-    telemetry = _telemetry(FakeDacWorker(settings=settings, registry=_registry(settings)))
-
-    [device] = telemetry.devices
-    assert device.available is True
-    assert device.channels == []
-
-
-def test_snapshot_never_touches_the_bus(fake_parts, monkeypatch) -> None:
-    """Building a snapshot calls no read API on the device or its channels."""
-    settings = DacServiceSettings(devices={"dac0": DacDeviceSettings(type="FAKE")})
     registry = _registry(settings)
-    registry.record_write("dac0", 0, 100, None)
-    device = registry.get("dac0")
-    channel = device.channels[0]
-    trap = Mock(side_effect=AssertionError("telemetry touched the bus"))
-    monkeypatch.setattr(type(device), "read_all", trap)
-    monkeypatch.setattr(type(channel), "readback", trap)
-    monkeypatch.setattr(type(channel), "value", trap)
+    poller = _poller(registry, settings)
+    registry.get("dac0").channels = (FakeDacChannel(0, value=100, reference=None),)
+    await poller.start()
+    try:
+        await poller._read_and_publish("dac0", 0)
+    finally:
+        await poller.stop()
 
-    telemetry = _telemetry(FakeDacWorker(settings=settings, registry=registry))
+    payload = build_telemetry(FakeDacWorker(settings=settings, registry=registry, poller=poller))
 
-    assert trap.call_count == 0
-    assert telemetry.devices[0].channels[0].code == 100
-
-
-def test_snapshot_reports_open_failure(fake_parts) -> None:
-    """A configured device that failed to open is still listed with its reason."""
-    settings = DacServiceSettings(devices={"broken": DacDeviceSettings(type="BROKEN")})
-
-    telemetry = _telemetry(FakeDacWorker(settings=settings, registry=_registry(settings)))
-
-    assert telemetry.configured is True
-    [device] = telemetry.devices
-    assert device.device_id == "broken"
-    assert device.type == "BROKEN"
-    assert device.available is False
-    assert device.error is not None
-    assert "SPI bus is gone" in device.error
-    assert device.channels == []
+    channel = payload["devices"]["dac0"]["channels"]["0"]
+    assert channel["value"] == 100.0
+    assert channel["code"] == 100
+    assert channel["output"] is None
 
 
-def test_snapshot_round_trips_through_msgpack(fake_parts) -> None:
-    """The wire form decodes back to an equal snapshot."""
-    settings = DacServiceSettings(devices={"dac0": DacDeviceSettings(type="FAKE", reference=3.3)})
+@pytest.mark.asyncio
+async def test_error_threshold_flips_state_and_recovery_clears_it(fake_parts) -> None:
+    """Consecutive failures reach the threshold; one success restores the device."""
+    settings = DacServiceSettings(devices={"dac0": DacDeviceSettings(type="FAKE")}, failure_threshold=2)
     registry = _registry(settings)
-    registry.record_write("dac0", 0, 4095, 3.3)
-    telemetry = _telemetry(FakeDacWorker(settings=settings, registry=registry))
+    poller = _poller(registry, settings)
+    channel = ToggleChannel()
+    registry.get("dac0").channels = (channel,)
+    await poller.start()
+    try:
+        channel.exc = OSError("bus error")
+        await poller._read_and_publish("dac0", 0)
+        await poller._read_and_publish("dac0", 0)
+        failed = build_telemetry(FakeDacWorker(settings=settings, registry=registry, poller=poller))
+        assert failed["state"] == "error"
+        assert failed["devices"]["dac0"]["state"] == "error"
+        assert failed["devices"]["dac0"]["last_error"] == "bus error"
+        assert failed["devices"]["dac0"]["channels"]["0"]["value"] is None
+        assert failed["devices"]["dac0"]["channels"]["0"]["error"] == "bus error"
 
-    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(telemetry), type=DacServiceTelemetry)
+        channel.exc = None
+        channel.value = 7
+        await poller._read_and_publish("dac0", 0)
+        recovered = build_telemetry(FakeDacWorker(settings=settings, registry=registry, poller=poller))
+        assert recovered["state"] == "ok"
+        assert recovered["devices"]["dac0"]["state"] == "ok"
+        assert recovered["devices"]["dac0"]["last_error"] is None
+        assert recovered["devices"]["dac0"]["channels"]["0"]["value"] == 7.0
+        assert recovered["devices"]["dac0"]["channels"]["0"]["error"] is None
+    finally:
+        await poller.stop()
 
-    assert decoded == telemetry
-    assert decoded.devices[0].channels[0].unit == "V"
+
+@pytest.mark.asyncio
+async def test_poll_disabled_reports_stopped(fake_parts) -> None:
+    """A configured device is still listed when service-wide polling is off."""
+    settings = DacServiceSettings(devices={"dac0": DacDeviceSettings(type="FAKE")}, poll_enabled=False)
+    registry = _registry(settings)
+    poller = _poller(registry, settings)
+    await poller.start()
+    await poller.stop()
+
+    payload = build_telemetry(FakeDacWorker(settings=settings, registry=registry, poller=poller))
+
+    assert payload["poll_enabled"] is False
+    assert payload["devices"]["dac0"]["state"] == "stopped"
 
 
 @pytest.mark.asyncio
@@ -157,10 +227,11 @@ async def test_telemetry_loop_writes_key_with_ttl(tmp_path, monkeypatch) -> None
     assert expiry.expiry_type == ExpiryType.SEC
     assert int(expiry.value) == 6
 
-    decoded = msgspec.msgpack.decode(value, type=DacServiceTelemetry)
-    assert decoded.configured is False
-    assert decoded.devices == []
-    assert decoded.schema_version == 1
+    decoded = msgspec.msgpack.decode(value, type=dict)
+    assert decoded["configured"] is False
+    assert decoded["devices"] == {}
+    assert decoded["state"] == "stopped"
+    assert decoded["schema_version"] == SCHEMA_VERSION
 
 
 @pytest.mark.asyncio
@@ -179,3 +250,10 @@ async def test_telemetry_loop_reports_write_failure(tmp_path, monkeypatch) -> No
     assert client.calls == 1
     assert len(failures) == 1
     assert str(failures[0]) == "valkey is down"
+
+
+def test_state_constants_are_the_contract() -> None:
+    """The three states the API and UI switch on are spelled exactly."""
+    assert telemetry_module.STATE_OK == "ok"
+    assert telemetry_module.STATE_ERROR == "error"
+    assert telemetry_module.STATE_STOPPED == "stopped"

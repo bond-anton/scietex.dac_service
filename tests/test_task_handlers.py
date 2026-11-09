@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import msgspec
 import pytest
+from conftest import RecordingStreamClient
 
 from scietex.dac_service.config import DacDeviceSettings, DacServiceSettings
 from scietex.dac_service.devices import (
@@ -15,6 +16,7 @@ from scietex.dac_service.devices import (
     DeviceOpenError,
     DeviceUnavailable,
 )
+from scietex.dac_service.poller import DacPoller
 from scietex.dac_service.task_handlers import (
     DAC_CONFIGURE_TASK_NAME,
     DAC_LIST_TASK_NAME,
@@ -57,8 +59,8 @@ def _capabilities() -> TaskCapabilities:
     return TaskCapabilities(task_id=uuid4(), _write_progress=_noop)
 
 
-def _handler(handler_class, registry: DacDeviceRegistry):
-    return handler_class("test", _context(), devices=registry)
+def _handler(handler_class, registry: DacDeviceRegistry, **kwargs):
+    return handler_class("test", _context(), devices=registry, **kwargs)
 
 
 def _task(task: str, payload: bytes | str | dict | None = None) -> TaskData:
@@ -388,6 +390,57 @@ async def test_write_records_the_last_written_state(fake_parts) -> None:
     [(channel, code, output)] = written["dac0"]
     assert (channel, code) == (1, 321)
     assert output == pytest.approx(321 * 3.3 / 4095)
+
+
+def _recording_poller(registry: DacDeviceRegistry, client: RecordingStreamClient) -> DacPoller:
+    return DacPoller(
+        registry,
+        logging.getLogger("test.dac_service.handlers.poller"),
+        service_name="DacService",
+        instance_id="inst",
+        client_provider=lambda: client,
+    )
+
+
+@pytest.mark.asyncio
+async def test_write_publishes_an_immediate_reading(fake_parts) -> None:
+    """A write reports its setpoint to the stream without waiting for a tick."""
+    settings = DacServiceSettings(devices={"dac0": DacDeviceSettings(type="FAKE", reference=3.3)})
+    registry = _registry(settings)
+    client = RecordingStreamClient()
+    poller = _recording_poller(registry, client)
+
+    result = await _handler(DacWriteHandler, registry, poller=poller).handle(
+        _task(DAC_WRITE_TASK_NAME, _json({"device_id": "dac0", "channel": 1, "code": 1234})),
+        capabilities=_capabilities(),
+    )
+
+    assert _decode(result, DacWriteResponse).output is None
+    [entry] = client.entries
+    key, fields, _ = entry
+    assert key == "scietex:DacService:inst:dac:dac0:1:readings"
+    assert fields[2] == (b"code", b"1234")
+    assert float(fields[3][1]) == pytest.approx(1234 * 3.3 / 4095)
+    assert poller.states["dac0"].channels[1].code == 1234
+
+
+@pytest.mark.asyncio
+async def test_write_publishes_the_cached_output_of_a_write_only_part(fake_parts) -> None:
+    """A write-only part's immediate reading carries its scaled output."""
+    settings = DacServiceSettings(devices={"dac0": DacDeviceSettings(type="WRITEONLY", reference=3.3)})
+    registry = _registry(settings)
+    client = RecordingStreamClient()
+    poller = _recording_poller(registry, client)
+
+    await _handler(DacWriteHandler, registry, poller=poller).handle(
+        _task(DAC_WRITE_TASK_NAME, _json({"device_id": "dac0", "output": 1.65})),
+        capabilities=_capabilities(),
+    )
+
+    [entry] = client.entries
+    fields = entry[1]
+    code = int(fields[2][1])
+    assert float(fields[3][1]) == pytest.approx(code * 3.3 / 4095)
 
 
 @pytest.mark.asyncio

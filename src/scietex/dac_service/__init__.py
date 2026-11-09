@@ -37,7 +37,6 @@ from .task_handlers import (
     DacWriteRequest,
     DacWriteResponse,
 )
-from .telemetry import DacChannelTelemetry, DacDeviceTelemetry, DacServiceTelemetry
 from .version import __version__
 
 __all__ = [
@@ -47,9 +46,6 @@ __all__ = [
     "DAC_SETTINGS_DEFAULTS",
     "DacDeviceSettings",
     "DacServiceSettings",
-    "DacChannelTelemetry",
-    "DacDeviceTelemetry",
-    "DacServiceTelemetry",
     "DacDeviceRegistry",
     "ChannelNotFound",
     "DeviceConfigError",
